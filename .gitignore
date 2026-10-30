@@ -4,6 +4,8 @@ __pycache__/
 bot.log
 local_state.json
 local_trades.csv
+pnl.log
+pnl_summary.json
 lightsail_part*.txt
 lightsail_update.zip
 local_bot_update.zip

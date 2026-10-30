@@ -123,11 +123,100 @@ def parse_market(event: Any, slug: str) -> dict[str, Any] | None:
     }
 
 
+class PnLTracker:
+    """Dedicated profit-and-loss ledger written to pnl.log.
+
+    Entry and exit records are written separately from runtime diagnostics.
+    A running summary is maintained in pnl_summary.json for quick inspection.
+    """
+
+    def __init__(self, log_path: Path, summary_path: Path):
+        self.log_path = log_path
+        self.summary_path = summary_path
+        self.trades: list[dict[str, Any]] = []
+        self._load_summary()
+
+    def _load_summary(self) -> None:
+        if not self.summary_path.exists():
+            return
+        try:
+            data = json.loads(self.summary_path.read_text(encoding="utf-8"))
+            self.trades = data.get("trades", [])
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    def record_entry(self, *, stamp: str, market_slug: str, outcome: str,
+                     quantity: Decimal, avg_price: Decimal, fees: Decimal,
+                     target: Decimal, stop: Decimal, cash_after: Decimal) -> None:
+        line = (f"[{stamp}] BUY  {market_slug} {outcome} | "
+                f"qty={quantity:.4f} @ {avg_price:.4f} | "
+                f"fees=${fees:.4f} | target={target:.4f} stop={stop:.4f} | "
+                f"cash=${cash_after:.2f}\n")
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+    def record_exit(self, *, stamp: str, market_slug: str, outcome: str,
+                    reason: str, quantity: Decimal, entry_price: Decimal,
+                    exit_price: Decimal, entry_fees: Decimal, exit_fees: Decimal,
+                    pnl: Decimal, position_age_s: Decimal,
+                    cash_after: Decimal, cumulative_pnl: Decimal) -> None:
+        result = "WIN" if pnl > ZERO else "LOSS" if pnl < ZERO else "FLAT"
+        total_fees = entry_fees + exit_fees
+        line = (f"[{stamp}] SELL {market_slug} {outcome} | "
+                f"reason={reason} | qty={quantity:.4f} | "
+                f"entry={entry_price:.4f} -> exit={exit_price:.4f} | "
+                f"fees=${total_fees:.4f} | P&L=${pnl:+.4f} ({result}) | "
+                f"hold={position_age_s:.1f}s | "
+                f"cash=${cash_after:.2f} | cumulative=${cumulative_pnl:+.4f}\n")
+        with self.log_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+        self.trades.append({
+            "time": stamp, "market": market_slug, "outcome": outcome,
+            "reason": reason, "entry": str(entry_price), "exit": str(exit_price),
+            "qty": str(quantity), "pnl": str(pnl), "fees": str(total_fees),
+            "hold_s": str(position_age_s),
+        })
+        self._save_summary(cash_after, cumulative_pnl)
+
+    def _save_summary(self, cash: Decimal, cumulative_pnl: Decimal) -> None:
+        wins = sum(1 for t in self.trades if D(t["pnl"]) > ZERO)
+        losses = sum(1 for t in self.trades if D(t["pnl"]) < ZERO)
+        total = len(self.trades)
+        win_rate = f"{wins / total * 100:.1f}%" if total else "N/A"
+        total_fees = sum(D(t["fees"]) for t in self.trades)
+        ledger_pnl = sum(D(t["pnl"]) for t in self.trades)
+        avg_pnl = ledger_pnl / total if total else ZERO
+        best = max((D(t["pnl"]) for t in self.trades), default=ZERO)
+        worst = min((D(t["pnl"]) for t in self.trades), default=ZERO)
+        avg_hold = sum(D(t["hold_s"]) for t in self.trades) / total if total else ZERO
+        summary = {
+            "updated_at": utc_now().isoformat(),
+            "total_trades": total,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": win_rate,
+            "cumulative_pnl": str(cumulative_pnl),
+            "ledger_pnl": str(ledger_pnl),
+            "avg_pnl_per_trade": str(avg_pnl.quantize(Decimal("0.0001"))),
+            "best_trade": str(best),
+            "worst_trade": str(worst),
+            "total_fees": str(total_fees),
+            "avg_hold_seconds": str(avg_hold.quantize(Decimal("0.1"))),
+            "cash": str(cash),
+            "trades": self.trades[-200:],
+        }
+        temp = self.summary_path.with_suffix(".tmp")
+        temp.write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        temp.replace(self.summary_path)
+
+
 class LocalPaperBot:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.state_path = ROOT / "local_state.json"
         self.csv_path = ROOT / "local_trades.csv"
+        self.pnl = PnLTracker(ROOT / "pnl.log", ROOT / "pnl_summary.json")
         self.markets: dict[str, dict[str, Any]] = {}
         self.asset_meta: dict[str, dict[str, Any]] = {}
         self.books: dict[str, dict[str, Any]] = {}
@@ -515,7 +604,7 @@ class LocalPaperBot:
         self.position = {
             "asset_id": asset_id, "market_slug": market["slug"], "market_id": market["market_id"],
             "outcome": outcome, "quantity": str(qty), "entry_price": str(avg),
-            "entry_cost": str(cost), "target": str(target), "stop": str(stop),
+            "entry_cost": str(cost), "entry_fees": str(fees), "target": str(target), "stop": str(stop),
             "market_end_ts": market["end_ts"], "last_bid": str(self.books[asset_id].get("last_bid") or ZERO),
             "realized_pnl": "0", "entry_at": utc_now().isoformat(),
             "highest_mid": str(mid),
@@ -531,6 +620,9 @@ class LocalPaperBot:
         bid_text = f"{bid:.4f}" if bid is not None else "n/a"
         ask_text = f"{ask:.4f}" if ask is not None else "n/a"
         stamp = utc_now().isoformat(timespec="milliseconds")
+        self.pnl.record_entry(stamp=stamp, market_slug=market["slug"], outcome=outcome,
+                              quantity=qty, avg_price=avg, fees=fees, target=target,
+                              stop=stop, cash_after=self.cash)
         print(f"{stamp} {market['slug']} {outcome} paper buy {qty:.4f} shares at avg {avg:.3f}; "
               f"trigger_mid={mid:.4f}, bid={bid_text}, ask={ask_text}, book_age_ms={book_age_ms}; "
               f"take_profit={target:.3f}, stop={stop:.3f}, fees=${fees:.4f}")
@@ -572,12 +664,15 @@ class LocalPaperBot:
         fill_text = ",".join(f"{price:.4f}x{shares:.4f}" for price, shares in fills)
         cost_left = D(position["entry_cost"])
         allocated_cost = cost_left if sold >= qty else cost_left * sold / qty
+        entry_fees_left = D(position.get("entry_fees"))
+        allocated_entry_fees = entry_fees_left if sold >= qty else entry_fees_left * sold / qty
         pnl = gross - fees - allocated_cost
         self.cash += gross - fees
         self.realized_pnl += pnl
         position["realized_pnl"] = str(D(position.get("realized_pnl")) + pnl)
         position["quantity"] = str(max(ZERO, qty - sold))
         position["entry_cost"] = str(max(ZERO, cost_left - allocated_cost))
+        position["entry_fees"] = str(max(ZERO, entry_fees_left - allocated_entry_fees))
         self.save_state()
         self.log_trade(market=market, outcome=position["outcome"], action="SELL", reason=reason,
                        quantity=sold, avg_price=avg, gross=gross, fees=fees, pnl=pnl,
@@ -586,6 +681,11 @@ class LocalPaperBot:
                        trigger_ask=trigger.get("ask"), last_trade=trigger.get("last_trade"),
                        book_age_ms=trigger.get("book_age_ms"), position_age_seconds=position_age,
                        fill_levels=fills)
+        self.pnl.record_exit(stamp=stamp, market_slug=market["slug"], outcome=position["outcome"],
+                             reason=reason, quantity=sold, entry_price=D(position["entry_price"]),
+                             exit_price=avg, entry_fees=allocated_entry_fees, exit_fees=fees,
+                             pnl=pnl, position_age_s=position_age, cash_after=self.cash,
+                             cumulative_pnl=self.realized_pnl)
         print(f"{stamp} {market['slug']} {position['outcome']} EXIT_FILL reason={reason}; "
               f"sold={sold:.4f}, avg={avg:.4f}, levels=[{fill_text}], fees=${fees:.4f}, "
               f"net_P&L=${pnl:.4f}, cumulative_realized_P&L=${self.realized_pnl:.4f}")
