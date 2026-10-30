@@ -823,7 +823,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--confirm-up-ticks", type=int, default=2, help="consecutive upticks required after crossing the signal threshold (default: 2)")
     result.add_argument("--max-spread", type=Decimal, default=Decimal("0.04"), help="maximum allowed bid-ask spread to enter (default: 0.04)")
     result.add_argument("--min-depth-shares", type=Decimal, default=Decimal("5.0"), help="minimum ask shares required in book to enter (default: 5.0)")
-    result.add_argument("--stall-timeout-seconds", type=float, default=15.0, help="exit position if breakout stalls without gain after this many seconds (default: 15.0, 0 to disable)")
+    result.add_argument("--stall-timeout-seconds", type=float, default=60.0, help="exit position if breakout stalls without gain after this many seconds (default: 60.0, 0 to disable)")
     result.add_argument("--entry-delay-seconds", type=int, default=20, help="wait this many seconds after each 5-minute market opens before checking entries")
     result.add_argument("--fee-rate", type=Decimal, default=FEE_RATE, help="Crypto taker fee rate used in local simulation")
     result.add_argument("--no-entry-last-seconds", type=int, default=20, help="stop entering this many seconds before market expiry")
