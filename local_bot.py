@@ -220,8 +220,8 @@ class LocalPaperBot:
         self.markets: dict[str, dict[str, Any]] = {}
         self.asset_meta: dict[str, dict[str, Any]] = {}
         self.books: dict[str, dict[str, Any]] = {}
-        self.pending_crosses: dict[str, int] = {}
-        self.flat_logged: set[str] = set()
+        self.pullback_state: dict[str, dict[str, Any]] = {}
+        self.pullback_samples: dict[str, list[tuple[float, Decimal]]] = {}
         self.stale_logged: set[str] = set()
         self.used_markets: set[str] = set()
         self.cash = args.initial_cash
@@ -448,44 +448,70 @@ class LocalPaperBot:
     def entry_signal(self, asset_id: str, mid: Decimal,
                      bid: Decimal | None, ask: Decimal | None) -> bool:
         book = self.books[asset_id]
-        previous = book.get("last_mid")
         book["last_mid"] = mid
-        if previous is None:
-            return False
         meta = self.asset_meta[asset_id]
         market_slug, outcome = meta["market"]["slug"], meta["outcome"]
         stamp = utc_now().isoformat(timespec="milliseconds")
         bid_text = f"{bid:.4f}" if bid is not None else "n/a"
         ask_text = f"{ask:.4f}" if ask is not None else "n/a"
-        if asset_id not in self.pending_crosses:
-            if previous < self.args.signal_threshold <= mid:
-                self.pending_crosses[asset_id] = 0
-                self.flat_logged.discard(asset_id)
-                print(f"{stamp} {market_slug} {outcome} crossed above {self.args.signal_threshold:.2f}: "
-                      f"mid={mid:.4f}, bid={bid_text}, ask={ask_text}; "
-                      f"waiting for {self.args.confirm_up_ticks} consecutive upticks")
+        state = self.pullback_state.setdefault(asset_id, {
+            "low": None, "peak": None, "armed": False, "retest": [],
+        })
+        now = time.monotonic()
+        samples = self.pullback_samples.setdefault(asset_id, [])
+        sampled = not samples or now - samples[-1][0] >= 0.5
+        if sampled:
+            samples.append((now, mid))
+        samples[:] = [(at, price) for at, price in samples if now - at <= 8.0]
+        large_drop = (sampled and len(samples) >= 2
+                      and mid < samples[-2][1] - Decimal("0.01"))
+
+        if not state["armed"]:
+            if mid <= Decimal("0.48"):
+                state["low"] = mid if state["low"] is None else min(state["low"], mid)
+            elif state["low"] is not None and mid >= Decimal("0.55"):
+                state["armed"] = True
+                state["peak"] = mid
+                state["retest"] = []
+                print(f"{stamp} {market_slug} {outcome} pullback setup armed: "
+                      f"low={state['low']:.4f}, peak={mid:.4f}; waiting for 0.50-0.52 retest")
             return False
-        if mid < self.args.signal_threshold or mid < previous:
-            ticks = self.pending_crosses[asset_id]
-            print(f"{stamp} {market_slug} {outcome} confirmation reset: "
-                  f"mid={mid:.4f}, previous_mid={previous:.4f}, bid={bid_text}, ask={ask_text}; "
-                  f"upticks={ticks}/{self.args.confirm_up_ticks}")
-            self.pending_crosses.pop(asset_id, None)
-            self.flat_logged.discard(asset_id)
+
+        if mid < Decimal("0.50"):
+            self.pullback_state[asset_id] = {
+                "low": mid if mid <= Decimal("0.48") else None,
+                "peak": None, "armed": False, "retest": [],
+            }
             return False
-        if mid == previous:
-            if asset_id not in self.flat_logged:
-                print(f"{stamp} {market_slug} {outcome} unchanged mid: "
-                      f"mid={mid:.4f}, bid={bid_text}, ask={ask_text}; "
-                      f"keeping upticks={self.pending_crosses[asset_id]}/{self.args.confirm_up_ticks}")
-                self.flat_logged.add(asset_id)
+        if mid > state["peak"]:
+            state["peak"] = mid
+            state["retest"] = []
+        if mid > Decimal("0.52"):
+            state["retest"] = []
             return False
-        self.pending_crosses[asset_id] += 1
-        self.flat_logged.discard(asset_id)
-        print(f"{stamp} {market_slug} {outcome} confirmation uptick "
-              f"{self.pending_crosses[asset_id]}/{self.args.confirm_up_ticks}: "
-              f"mid={mid:.4f}, bid={bid_text}, ask={ask_text}")
-        return self.pending_crosses[asset_id] >= self.args.confirm_up_ticks
+
+        # Require the retest to stabilize and turn up before entering, so a
+        # falling quote inside the target range is not treated as a buy signal.
+        if sampled:
+            retest = state["retest"]
+            if large_drop or (retest and mid < retest[-1][1] - Decimal("0.01")):
+                retest.clear()
+            retest.append((now, mid))
+            retest[:] = retest[-(self.args.confirm_up_ticks + 1):]
+        needed = self.args.confirm_up_ticks + 1
+        if len(state["retest"]) < needed:
+            return False
+        window = state["retest"][-needed:]
+        prices = [price for _, price in window]
+        gaps = [window[i][0] - window[i - 1][0] for i in range(1, len(window))]
+        if (any(gap > 1.5 for gap in gaps)
+                or any(price < Decimal("0.50") or price > Decimal("0.52") for price in prices)
+                or any(prices[i] <= prices[i - 1] for i in range(1, len(prices)))):
+            return False
+        print(f"{stamp} {market_slug} {outcome} pullback-entry signal: "
+              f"peak={state['peak']:.4f}, retest={mid:.4f}, bid={bid_text}, ask={ask_text}; "
+              f"{self.args.confirm_up_ticks} consecutive upticks")
+        return True
 
     def evaluate(self, asset_id: str) -> None:
         meta = self.asset_meta.get(asset_id)
@@ -521,6 +547,7 @@ class LocalPaperBot:
             if mid > highest_mid:
                 highest_mid = mid
                 self.position["highest_mid"] = str(highest_mid)
+                self.position["last_progress_at"] = utc_now().isoformat()
 
             try:
                 entry_at = datetime.fromisoformat(self.position["entry_at"])
@@ -535,8 +562,14 @@ class LocalPaperBot:
                 reason = "stop_loss"
             elif market["end_ts"] - now <= self.args.force_exit_last_seconds:
                 reason = "time_exit"
-            elif self.args.stall_timeout_seconds > 0 and pos_age >= self.args.stall_timeout_seconds:
-                if mid <= entry_price:
+            elif self.args.stall_timeout_seconds > 0:
+                try:
+                    progress_at = datetime.fromisoformat(
+                        self.position.get("last_progress_at") or self.position["entry_at"])
+                    stalled_for = max(0.0, (utc_now() - progress_at).total_seconds())
+                except (KeyError, TypeError, ValueError):
+                    stalled_for = pos_age
+                if stalled_for >= self.args.stall_timeout_seconds:
                     reason = "breakout_failure"
 
             if reason:
@@ -551,15 +584,15 @@ class LocalPaperBot:
         now = time.time()
         if not (market["start_ts"] <= now < market["end_ts"] - self.args.no_entry_last_seconds):
             book["last_mid"] = mid
-            self.pending_crosses.pop(asset_id, None)
-            self.flat_logged.discard(asset_id)
+            self.pullback_state.pop(asset_id, None)
+            self.pullback_samples.pop(asset_id, None)
             return
         if now < market["start_ts"] + self.args.entry_delay_seconds:
             # Ignore the opening 20 seconds and seed the signal baseline from
             # fresh quotes so a move during the excluded window is not reused.
             book["last_mid"] = mid
-            self.pending_crosses.pop(asset_id, None)
-            self.flat_logged.discard(asset_id)
+            self.pullback_state.pop(asset_id, None)
+            self.pullback_samples.pop(asset_id, None)
             return
         if self.entry_signal(asset_id, mid, bid, ask):
             self.enter(asset_id, outcome, mid, bid, ask, market, book_age_ms)
@@ -579,10 +612,11 @@ class LocalPaperBot:
                   f"spread too wide; mid={mid:.4f}, bid={bid:.4f}, ask={ask:.4f}, "
                   f"spread={spread:.4f}, max_allowed={self.args.max_spread:.4f}")
             return
-        max_price = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
-        if ask < self.args.entry or ask > max_price:
+        min_price = max(Decimal("0.50"), self.args.entry)
+        max_price = min(Decimal("0.52"), self.args.entry + self.args.entry_slippage)
+        if ask < min_price or ask > max_price:
             print(f"{stamp} {market['slug']} {outcome} entry skipped: "
-                  f"mid={mid:.4f}, ask={ask:.4f}, allowed_ask={self.args.entry:.4f}-{max_price:.4f}")
+                  f"mid={mid:.4f}, ask={ask:.4f}, allowed_ask={min_price:.4f}-{max_price:.4f}")
             return
         budget = min(self.args.stake, self.cash)
         qty, avg, gross, fees = self.simulate_buy(asset_id, budget, max_price)
@@ -607,10 +641,9 @@ class LocalPaperBot:
             "entry_cost": str(cost), "entry_fees": str(fees), "target": str(target), "stop": str(stop),
             "market_end_ts": market["end_ts"], "last_bid": str(self.books[asset_id].get("last_bid") or ZERO),
             "realized_pnl": "0", "entry_at": utc_now().isoformat(),
-            "highest_mid": str(mid),
+            "highest_mid": str(mid), "last_progress_at": utc_now().isoformat(),
         }
         self.used_markets.add(market["slug"])
-        self.pending_crosses.pop(asset_id, None)
         self.save_state()
         self.log_trade(market=market, outcome=outcome, action="BUY", reason="entry",
                        quantity=qty, avg_price=avg, gross=gross, fees=fees,
@@ -713,11 +746,14 @@ class LocalPaperBot:
                 pos_age = max(0.0, (utc_now() - entry_at).total_seconds())
             except (KeyError, TypeError, ValueError):
                 pos_age = 0.0
-            if pos_age >= self.args.stall_timeout_seconds:
-                bid, ask, mid = self.quote(asset_id)
-                entry_price = D(self.position.get("entry_price") or ZERO)
-                if mid is not None and mid <= entry_price:
-                    reason = "breakout_failure"
+            try:
+                progress_at = datetime.fromisoformat(
+                    self.position.get("last_progress_at") or self.position["entry_at"])
+                stalled_for = max(0.0, (utc_now() - progress_at).total_seconds())
+            except (KeyError, TypeError, ValueError):
+                stalled_for = pos_age
+            if stalled_for >= self.args.stall_timeout_seconds:
+                reason = "breakout_failure"
 
         if not reason:
             return
@@ -752,11 +788,11 @@ class LocalPaperBot:
 
         assets = self.discover()
         print(f"Polymarket public-market paper trader | starting virtual cash ${self.args.initial_cash:.2f}")
-        max_entry = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
-        print(f"Strategy: signal at mid >= {self.args.signal_threshold:.2f}; confirm with "
-              f"{self.args.confirm_up_ticks} uptick(s); start entry checks "
+        max_entry = min(Decimal("0.52"), self.args.entry + self.args.entry_slippage)
+        print(f"Strategy: arm after a low <= 0.48 rallies to mid >= 0.55; enter on a confirmed "
+              f"0.50-0.52 pullback; start entry checks "
               f"{self.args.entry_delay_seconds}s after each market opens; buy only when ask is "
-              f"{self.args.entry:.2f}-{max_entry:.2f} and spread <= {self.args.max_spread:.2f}; "
+              f"0.50-{max_entry:.2f} and spread <= {self.args.max_spread:.2f}; "
               f"stop={self.args.stop_multiple*Decimal('100'):.0f}%, "
               f"stall exit={self.args.stall_timeout_seconds:.0f}s; exits use fill-based or fixed prices.")
         print("Public market data only. No API key or wallet required; no real orders are sent. Press Ctrl+C to stop.")
@@ -811,19 +847,18 @@ class LocalPaperBot:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Local paper trading on Polymarket BTC 5-minute Up/Down")
-    result.add_argument("--signal-threshold", type=Decimal, default=Decimal("0.58"), help="price level that starts entry confirmation (default: 0.58)")
-    result.add_argument("--entry", type=Decimal, default=Decimal("0.60"), help="minimum ask price for a paper buy (default: 0.60)")
+    result.add_argument("--entry", type=Decimal, default=Decimal("0.50"), help="minimum ask price for a paper buy (default: 0.50)")
     result.add_argument("--stake", type=Decimal, default=Decimal("4.00"), help="virtual amount per trade in USD (default: 4)")
     result.add_argument("--initial-cash", type=Decimal, default=Decimal("100.00"), help="starting virtual cash in USD")
-    result.add_argument("--entry-slippage", type=Decimal, default=Decimal("0.03"), help="maximum entry slippage")
+    result.add_argument("--entry-slippage", type=Decimal, default=Decimal("0.02"), help="maximum entry slippage (hard-capped at 0.52)")
     result.add_argument("--take-profit-multiple", type=Decimal, default=Decimal("1.20"), help="take-profit multiple of entry price")
-    result.add_argument("--stop-multiple", type=Decimal, default=Decimal("0.85"), help="stop-loss multiple of entry price (default: 0.85)")
+    result.add_argument("--stop-multiple", type=Decimal, default=Decimal("0.93"), help="stop-loss multiple of entry price (default: 0.93)")
     result.add_argument("--take-profit-price", type=Decimal, default=None, help="fixed take-profit price, e.g. 0.40")
     result.add_argument("--stop-price", type=Decimal, default=None, help="fixed stop-loss price, e.g. 0.10")
-    result.add_argument("--confirm-up-ticks", type=int, default=2, help="consecutive upticks required after crossing the signal threshold (default: 2)")
+    result.add_argument("--confirm-up-ticks", type=int, default=2, help="consecutive sampled upticks required in the pullback range (default: 2)")
     result.add_argument("--max-spread", type=Decimal, default=Decimal("0.04"), help="maximum allowed bid-ask spread to enter (default: 0.04)")
     result.add_argument("--min-depth-shares", type=Decimal, default=Decimal("5.0"), help="minimum ask shares required in book to enter (default: 5.0)")
-    result.add_argument("--stall-timeout-seconds", type=float, default=60.0, help="exit position if breakout stalls without gain after this many seconds (default: 60.0, 0 to disable)")
+    result.add_argument("--stall-timeout-seconds", type=float, default=18.0, help="exit if no new high is made for this many seconds (default: 18.0, 0 to disable)")
     result.add_argument("--entry-delay-seconds", type=int, default=20, help="wait this many seconds after each 5-minute market opens before checking entries")
     result.add_argument("--fee-rate", type=Decimal, default=FEE_RATE, help="Crypto taker fee rate used in local simulation")
     result.add_argument("--no-entry-last-seconds", type=int, default=20, help="stop entering this many seconds before market expiry")
@@ -839,8 +874,8 @@ def main() -> int:
     sys.stderr = Tee(sys.stderr, log_file)
     print(f"\n--- Run started at {utc_now().isoformat()} ---")
     args = parser().parse_args()
-    if not (ZERO < args.signal_threshold < args.entry < Decimal("1")) or args.stake <= ZERO or args.initial_cash <= ZERO:
-        print("signal-threshold must be positive and below entry; entry must be below 1; stake and initial-cash must be positive.", file=sys.stderr)
+    if not (ZERO < args.entry < Decimal("1")) or args.stake <= ZERO or args.initial_cash <= ZERO:
+        print("entry must be positive and below 1; stake and initial-cash must be positive.", file=sys.stderr)
         return 2
     if (args.take_profit_price is None) != (args.stop_price is None):
         print("fixed-price mode requires both --take-profit-price and --stop-price.", file=sys.stderr)
