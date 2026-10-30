@@ -464,17 +464,19 @@ class LocalPaperBot:
             return False
         window = samples[-needed:]
         prices = [price for _, price in window]
+        recent_low = min(price for _, price in samples)
         gaps = [window[i][0] - window[i - 1][0] for i in range(1, len(window))]
         if (any(gap > 1.5 for gap in gaps)
                 or any(prices[i] <= prices[i - 1] for i in range(1, len(prices)))
-                or prices[-1] - min(price for _, price in samples) < Decimal("0.03")
+                or recent_low > Decimal("0.48")
+                or prices[-1] - recent_low < Decimal("0.03")
                 or any(samples[i][1] < samples[i - 1][1] - Decimal("0.01")
                        for i in range(1, len(samples)))):
             return False
         print(f"{stamp} {market_slug} {outcome} rising-entry signal: "
               f"start={prices[0]:.4f}, mid={mid:.4f}, bid={bid_text}, ask={ask_text}; "
               f"{self.args.confirm_up_ticks} consecutive upticks, "
-              f"rise_from_recent_low={mid - min(price for _, price in samples):.4f}")
+              f"rise_from_recent_low={mid - recent_low:.4f}")
         return True
 
     def evaluate(self, asset_id: str) -> None:
