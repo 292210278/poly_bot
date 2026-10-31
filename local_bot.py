@@ -447,6 +447,16 @@ class LocalPaperBot:
 
     def entry_signal(self, asset_id: str, mid: Decimal,
                      bid: Decimal | None, ask: Decimal | None) -> bool:
+        if self.args.strategy == "high-confidence":
+            if ask is None or ask < self.args.high_confidence_min_price or ask > self.args.high_confidence_max_price:
+                return False
+            meta = self.asset_meta[asset_id]
+            stamp = utc_now().isoformat(timespec="milliseconds")
+            print(f"{stamp} {meta['market']['slug']} {meta['outcome']} high-confidence entry signal: "
+                  f"ask={ask:.4f}, allowed={self.args.high_confidence_min_price:.2f}-"
+                  f"{self.args.high_confidence_max_price:.2f}")
+            return True
+
         book = self.books[asset_id]
         previous = book.get("last_mid")
         book["last_mid"] = mid
@@ -535,7 +545,9 @@ class LocalPaperBot:
                 reason = "stop_loss"
             elif market["end_ts"] - now <= self.args.force_exit_last_seconds:
                 reason = "time_exit"
-            elif self.args.stall_timeout_seconds > 0 and pos_age >= self.args.stall_timeout_seconds:
+            elif (self.args.strategy != "high-confidence"
+                  and self.args.stall_timeout_seconds > 0
+                  and pos_age >= self.args.stall_timeout_seconds):
                 if mid <= entry_price:
                     reason = "breakout_failure"
 
@@ -579,10 +591,15 @@ class LocalPaperBot:
                   f"spread too wide; mid={mid:.4f}, bid={bid:.4f}, ask={ask:.4f}, "
                   f"spread={spread:.4f}, max_allowed={self.args.max_spread:.4f}")
             return
-        max_price = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
-        if ask < self.args.entry or ask > max_price:
+        if self.args.strategy == "high-confidence":
+            min_price = self.args.high_confidence_min_price
+            max_price = self.args.high_confidence_max_price
+        else:
+            min_price = self.args.entry
+            max_price = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
+        if ask < min_price or ask > max_price:
             print(f"{stamp} {market['slug']} {outcome} entry skipped: "
-                  f"mid={mid:.4f}, ask={ask:.4f}, allowed_ask={self.args.entry:.4f}-{max_price:.4f}")
+                  f"mid={mid:.4f}, ask={ask:.4f}, allowed_ask={min_price:.4f}-{max_price:.4f}")
             return
         budget = min(self.args.stake, self.cash)
         qty, avg, gross, fees = self.simulate_buy(asset_id, budget, max_price)
@@ -599,7 +616,10 @@ class LocalPaperBot:
                   f"cost=${cost:.4f} exceeds virtual cash=${self.cash:.4f}; ask={ask:.4f}")
             return
         target = self.args.take_profit_price if self.args.take_profit_price is not None else avg * self.args.take_profit_multiple
-        stop = self.args.stop_price if self.args.stop_price is not None else avg * self.args.stop_multiple
+        if self.args.strategy == "high-confidence":
+            stop = avg * (Decimal("1") - self.args.high_confidence_stop_loss)
+        else:
+            stop = self.args.stop_price if self.args.stop_price is not None else avg * self.args.stop_multiple
         self.cash -= cost
         self.position = {
             "asset_id": asset_id, "market_slug": market["slug"], "market_id": market["market_id"],
@@ -707,7 +727,7 @@ class LocalPaperBot:
         reason = ""
         if market_end - Decimal(str(now)) <= self.args.force_exit_last_seconds:
             reason = "time_exit"
-        elif self.args.stall_timeout_seconds > 0:
+        elif self.args.strategy != "high-confidence" and self.args.stall_timeout_seconds > 0:
             try:
                 entry_at = datetime.fromisoformat(self.position["entry_at"])
                 pos_age = max(0.0, (utc_now() - entry_at).total_seconds())
@@ -752,13 +772,20 @@ class LocalPaperBot:
 
         assets = self.discover()
         print(f"Polymarket public-market paper trader | starting virtual cash ${self.args.initial_cash:.2f}")
-        max_entry = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
-        print(f"Strategy: signal at mid >= {self.args.signal_threshold:.2f}; confirm with "
-              f"{self.args.confirm_up_ticks} uptick(s); start entry checks "
-              f"{self.args.entry_delay_seconds}s after each market opens; buy only when ask is "
-              f"{self.args.entry:.2f}-{max_entry:.2f} and spread <= {self.args.max_spread:.2f}; "
-              f"stop={self.args.stop_multiple*Decimal('100'):.0f}%, "
-              f"stall exit={self.args.stall_timeout_seconds:.0f}s; exits use fill-based or fixed prices.")
+        if self.args.strategy == "high-confidence":
+            print(f"Strategy: high-confidence outcome entry; buy only when ask is "
+                  f"{self.args.high_confidence_min_price:.2f}-{self.args.high_confidence_max_price:.2f} "
+                  f"and spread <= {self.args.max_spread:.2f}; stop loss="
+                  f"{self.args.high_confidence_stop_loss * Decimal('100'):.1f}% from average fill; "
+                  f"stall exit disabled; entry checks start {self.args.entry_delay_seconds}s after market open.")
+        else:
+            max_entry = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
+            print(f"Strategy: signal at mid >= {self.args.signal_threshold:.2f}; confirm with "
+                  f"{self.args.confirm_up_ticks} uptick(s); start entry checks "
+                  f"{self.args.entry_delay_seconds}s after each market opens; buy only when ask is "
+                  f"{self.args.entry:.2f}-{max_entry:.2f} and spread <= {self.args.max_spread:.2f}; "
+                  f"stop={self.args.stop_multiple*Decimal('100'):.0f}%, "
+                  f"stall exit={self.args.stall_timeout_seconds:.0f}s; exits use fill-based or fixed prices.")
         print("Public market data only. No API key or wallet required; no real orders are sent. Press Ctrl+C to stop.")
         if not assets:
             print("No current BTC 5-minute market found; retrying discovery.")
@@ -811,6 +838,14 @@ class LocalPaperBot:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Local paper trading on Polymarket BTC 5-minute Up/Down")
+    result.add_argument("--strategy", choices=("default", "high-confidence"), default="default",
+                        help="entry strategy: default breakout confirmation or high-confidence price range")
+    result.add_argument("--high-confidence-min-price", type=Decimal, default=Decimal("0.78"),
+                        help="minimum ask price for high-confidence entries (default: 0.78)")
+    result.add_argument("--high-confidence-max-price", type=Decimal, default=Decimal("0.95"),
+                        help="maximum ask price for high-confidence entries (default: 0.95)")
+    result.add_argument("--high-confidence-stop-loss", type=Decimal, default=Decimal("0.097"),
+                        help="fractional loss from average fill that triggers high-confidence stop (default: 0.097)")
     result.add_argument("--signal-threshold", type=Decimal, default=Decimal("0.58"), help="price level that starts entry confirmation (default: 0.58)")
     result.add_argument("--entry", type=Decimal, default=Decimal("0.60"), help="minimum ask price for a paper buy (default: 0.60)")
     result.add_argument("--stake", type=Decimal, default=Decimal("4.00"), help="virtual amount per trade in USD (default: 4)")
@@ -854,6 +889,10 @@ def main() -> int:
         return 2
     if args.confirm_up_ticks < 1 or not (ZERO <= args.fee_rate <= Decimal("1")):
         print("confirm-up-ticks must be positive and fee-rate must be between 0 and 1.", file=sys.stderr)
+        return 2
+    if (not (ZERO < args.high_confidence_min_price < args.high_confidence_max_price < Decimal("1"))
+            or not (ZERO < args.high_confidence_stop_loss < Decimal("1"))):
+        print("high-confidence price bounds must be between 0 and 1, and stop-loss must be a fraction between 0 and 1.", file=sys.stderr)
         return 2
     if args.max_spread is not None and args.max_spread <= ZERO:
         print("max-spread must be positive.", file=sys.stderr)

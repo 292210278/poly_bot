@@ -18,6 +18,22 @@
 - 模拟成交计入可配置的 taker fee（默认 7% 的费率参数，按 Polymarket 加密市场公式估算）。实际费用可能因市场设置变化；模拟结果仅供比较策略。
 - 只同时持有一个仓位，每个 5 分钟市场最多入场一次。
 
+## 高确定性价格策略
+
+通过独立策略分支模拟买入市场价格显示高胜率的 Up/Down 结果份额：
+
+- 启动参数使用 `--strategy high-confidence`。
+- 仅当卖一价（ask）在 78¢–95¢ 区间时触发入场；点差、盘口深度、市场开盘等待和临近结束不入场规则继续生效。
+- 按实际模拟成交均价计算止损价：`均价 × (1 - 0.097)`，即价格相对入场均价下跌 9.7% 时止损。
+- 此模式关闭默认的停滞退出；止盈设置、到期前强制退出和其他模拟成交规则仍然有效。
+- 区间和止损比例可通过 `--high-confidence-min-price`、`--high-confidence-max-price`、`--high-confidence-stop-loss` 调整。
+
+示例：
+
+```powershell
+py .\bot.py --strategy high-confidence --stake 4 --initial-cash 100
+```
+
 ## Windows 启动
 
 ```powershell
