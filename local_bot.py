@@ -450,11 +450,6 @@ class LocalPaperBot:
         if self.args.strategy == "high-confidence":
             if ask is None or ask < self.args.high_confidence_min_price or ask > self.args.high_confidence_max_price:
                 return False
-            meta = self.asset_meta[asset_id]
-            stamp = utc_now().isoformat(timespec="milliseconds")
-            print(f"{stamp} {meta['market']['slug']} {meta['outcome']} high-confidence entry signal: "
-                  f"ask={ask:.4f}, allowed={self.args.high_confidence_min_price:.2f}-"
-                  f"{self.args.high_confidence_max_price:.2f}")
             return True
 
         book = self.books[asset_id]
@@ -580,16 +575,19 @@ class LocalPaperBot:
               ask: Decimal | None, market: dict[str, Any], book_age_ms: int) -> None:
         stamp = utc_now().isoformat(timespec="milliseconds")
         if ask is None:
-            print(f"{stamp} {market['slug']} {outcome} entry skipped: ask unavailable; mid={mid:.4f}")
+            if self.args.strategy != "high-confidence":
+                print(f"{stamp} {market['slug']} {outcome} entry skipped: ask unavailable; mid={mid:.4f}")
             return
         if bid is None:
-            print(f"{stamp} {market['slug']} {outcome} entry skipped: bid unavailable; mid={mid:.4f}")
+            if self.args.strategy != "high-confidence":
+                print(f"{stamp} {market['slug']} {outcome} entry skipped: bid unavailable; mid={mid:.4f}")
             return
         spread = ask - bid
         if self.args.max_spread is not None and spread > self.args.max_spread:
-            print(f"{stamp} {market['slug']} {outcome} entry skipped: "
-                  f"spread too wide; mid={mid:.4f}, bid={bid:.4f}, ask={ask:.4f}, "
-                  f"spread={spread:.4f}, max_allowed={self.args.max_spread:.4f}")
+            if self.args.strategy != "high-confidence":
+                print(f"{stamp} {market['slug']} {outcome} entry skipped: "
+                      f"spread too wide; mid={mid:.4f}, bid={bid:.4f}, ask={ask:.4f}, "
+                      f"spread={spread:.4f}, max_allowed={self.args.max_spread:.4f}")
             return
         if self.args.strategy == "high-confidence":
             min_price = self.args.high_confidence_min_price
@@ -598,22 +596,25 @@ class LocalPaperBot:
             min_price = self.args.entry
             max_price = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
         if ask < min_price or ask > max_price:
-            print(f"{stamp} {market['slug']} {outcome} entry skipped: "
-                  f"mid={mid:.4f}, ask={ask:.4f}, allowed_ask={min_price:.4f}-{max_price:.4f}")
+            if self.args.strategy != "high-confidence":
+                print(f"{stamp} {market['slug']} {outcome} entry skipped: "
+                      f"mid={mid:.4f}, ask={ask:.4f}, allowed_ask={min_price:.4f}-{max_price:.4f}")
             return
         budget = min(self.args.stake, self.cash)
         qty, avg, gross, fees = self.simulate_buy(asset_id, budget, max_price)
         min_size = D(self.books[asset_id].get("min_order_size") or market.get("min_order_size"))
         required_shares = max(min_size, self.args.min_depth_shares)
         if qty <= ZERO or qty < required_shares:
-            print(f"{stamp} {market['slug']} {outcome} entry skipped: "
-                  f"insufficient ask depth; mid={mid:.4f}, ask={ask:.4f}, "
-                  f"available_shares={qty:.4f}, required_shares={required_shares:.4f}")
+            if self.args.strategy != "high-confidence":
+                print(f"{stamp} {market['slug']} {outcome} entry skipped: "
+                      f"insufficient ask depth; mid={mid:.4f}, ask={ask:.4f}, "
+                      f"available_shares={qty:.4f}, required_shares={required_shares:.4f}")
             return
         cost = gross + fees
         if cost > self.cash:
-            print(f"{stamp} {market['slug']} {outcome} entry skipped: "
-                  f"cost=${cost:.4f} exceeds virtual cash=${self.cash:.4f}; ask={ask:.4f}")
+            if self.args.strategy != "high-confidence":
+                print(f"{stamp} {market['slug']} {outcome} entry skipped: "
+                      f"cost=${cost:.4f} exceeds virtual cash=${self.cash:.4f}; ask={ask:.4f}")
             return
         target = self.args.take_profit_price if self.args.take_profit_price is not None else avg * self.args.take_profit_multiple
         if self.args.strategy == "high-confidence":
