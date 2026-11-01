@@ -23,10 +23,11 @@
 通过独立策略分支模拟买入市场价格显示高胜率的 Up/Down 结果份额：
 
 - 启动参数使用 `--strategy high-confidence`。
-- 仅当卖一价（ask）在 78¢–95¢ 区间时触发入场；点差、盘口深度、市场开盘等待和临近结束不入场规则继续生效。
-- 按实际模拟成交均价计算止损价：`均价 × (1 - 0.097)`，即价格相对入场均价下跌 9.7% 时止损。
+- 卖一价（ask）进入 78¢–95¢ 区间后，还需每 0.5 秒采样到 2 次连续严格上涨（共 3 个递增 mid 样本）才入场；样本间隔超过 1.5 秒或价格回落时重新确认。点差、盘口深度、市场开盘等待和临近结束不入场规则继续生效。
+- 默认止盈目标为入场均价的 1.2 倍，最高封顶 99¢，避免高价入场时目标超过合约最高价；止损价按实际模拟成交均价计算：`均价 × (1 - 0.097)`。
+- 高确定性模式在可成交 bid 到达止损价时立即触发止损，不再额外等待 mid 跌破；实际卖出仍按当时买盘档位模拟，成交低于止损价的差额会写入 `bot.log` 的 `stop_gap_per_share`。
 - 此模式关闭默认的停滞退出；止盈设置、到期前强制退出和其他模拟成交规则仍然有效。
-- 区间和止损比例可通过 `--high-confidence-min-price`、`--high-confidence-max-price`、`--high-confidence-stop-loss` 调整。
+- 区间、确认次数/采样间隔、最大样本间隔和止损比例可通过 `--high-confidence-min-price`、`--high-confidence-max-price`、`--high-confidence-confirm-up-ticks`、`--high-confidence-sample-seconds`、`--high-confidence-max-sample-gap-seconds`、`--high-confidence-stop-loss` 调整。
 
 示例：
 

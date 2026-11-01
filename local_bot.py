@@ -222,6 +222,7 @@ class LocalPaperBot:
         self.books: dict[str, dict[str, Any]] = {}
         self.pending_crosses: dict[str, int] = {}
         self.flat_logged: set[str] = set()
+        self.high_confidence_samples: dict[str, list[tuple[float, Decimal]]] = {}
         self.stale_logged: set[str] = set()
         self.used_markets: set[str] = set()
         self.cash = args.initial_cash
@@ -449,7 +450,27 @@ class LocalPaperBot:
                      bid: Decimal | None, ask: Decimal | None) -> bool:
         if self.args.strategy == "high-confidence":
             if ask is None or ask < self.args.high_confidence_min_price or ask > self.args.high_confidence_max_price:
+                self.high_confidence_samples.pop(asset_id, None)
                 return False
+            now = time.monotonic()
+            samples = self.high_confidence_samples.setdefault(asset_id, [])
+            if (not samples
+                    or now - samples[-1][0] >= self.args.high_confidence_sample_seconds):
+                if samples:
+                    gap = now - samples[-1][0]
+                    if (gap > self.args.high_confidence_max_sample_gap_seconds
+                            or mid <= samples[-1][1]):
+                        samples.clear()
+                samples.append((now, mid))
+                samples[:] = samples[-(self.args.high_confidence_confirm_up_ticks + 1):]
+
+            needed = self.args.high_confidence_confirm_up_ticks + 1
+            if len(samples) < needed:
+                return False
+            window = samples[-needed:]
+            if any(window[i][1] <= window[i - 1][1] for i in range(1, len(window))):
+                return False
+            samples.clear()
             return True
 
         book = self.books[asset_id]
@@ -536,7 +557,8 @@ class LocalPaperBot:
             reason = ""
             if mid >= target and bid is not None and bid >= target:
                 reason = "take_profit"
-            elif mid <= stop and bid is not None and bid <= stop:
+            elif (bid is not None and bid <= stop
+                  and (self.args.strategy == "high-confidence" or mid <= stop)):
                 reason = "stop_loss"
             elif market["end_ts"] - now <= self.args.force_exit_last_seconds:
                 reason = "time_exit"
@@ -560,6 +582,7 @@ class LocalPaperBot:
             book["last_mid"] = mid
             self.pending_crosses.pop(asset_id, None)
             self.flat_logged.discard(asset_id)
+            self.high_confidence_samples.pop(asset_id, None)
             return
         if now < market["start_ts"] + self.args.entry_delay_seconds:
             # Ignore the opening 20 seconds and seed the signal baseline from
@@ -567,6 +590,7 @@ class LocalPaperBot:
             book["last_mid"] = mid
             self.pending_crosses.pop(asset_id, None)
             self.flat_logged.discard(asset_id)
+            self.high_confidence_samples.pop(asset_id, None)
             return
         if self.entry_signal(asset_id, mid, bid, ask):
             self.enter(asset_id, outcome, mid, bid, ask, market, book_age_ms)
@@ -616,7 +640,12 @@ class LocalPaperBot:
                 print(f"{stamp} {market['slug']} {outcome} entry skipped: "
                       f"cost=${cost:.4f} exceeds virtual cash=${self.cash:.4f}; ask={ask:.4f}")
             return
-        target = self.args.take_profit_price if self.args.take_profit_price is not None else avg * self.args.take_profit_multiple
+        if self.args.take_profit_price is not None:
+            target = self.args.take_profit_price
+        else:
+            target = avg * self.args.take_profit_multiple
+            if self.args.strategy == "high-confidence":
+                target = min(Decimal("0.99"), target)
         if self.args.strategy == "high-confidence":
             stop = avg * (Decimal("1") - self.args.high_confidence_stop_loss)
         else:
@@ -707,9 +736,12 @@ class LocalPaperBot:
                              exit_price=avg, entry_fees=allocated_entry_fees, exit_fees=fees,
                              pnl=pnl, position_age_s=position_age, cash_after=self.cash,
                              cumulative_pnl=self.realized_pnl)
+        stop_gap_per_share = max(ZERO, D(position["stop"]) - avg) if reason == "stop_loss" else ZERO
+        stop_gap_text = f", stop_gap_per_share={stop_gap_per_share:.4f}" if reason == "stop_loss" else ""
         print(f"{stamp} {market['slug']} {position['outcome']} EXIT_FILL reason={reason}; "
               f"sold={sold:.4f}, avg={avg:.4f}, levels=[{fill_text}], fees=${fees:.4f}, "
-              f"net_P&L=${pnl:.4f}, cumulative_realized_P&L=${self.realized_pnl:.4f}")
+              f"net_P&L=${pnl:.4f}, cumulative_realized_P&L=${self.realized_pnl:.4f}"
+              f"{stop_gap_text}")
         if D(position["quantity"]) <= Decimal("0.000001"):
             self.position = None
             self.save_state()
@@ -778,6 +810,8 @@ class LocalPaperBot:
                   f"{self.args.high_confidence_min_price:.2f}-{self.args.high_confidence_max_price:.2f} "
                   f"and spread <= {self.args.max_spread:.2f}; stop loss="
                   f"{self.args.high_confidence_stop_loss * Decimal('100'):.1f}% from average fill; "
+                  f"entry confirmation={self.args.high_confidence_confirm_up_ticks} sampled upticks "
+                  f"every {self.args.high_confidence_sample_seconds:.1f}s; "
                   f"stall exit disabled; entry checks start {self.args.entry_delay_seconds}s after market open.")
         else:
             max_entry = min(Decimal("0.99"), self.args.entry + self.args.entry_slippage)
@@ -847,6 +881,12 @@ def parser() -> argparse.ArgumentParser:
                         help="maximum ask price for high-confidence entries (default: 0.95)")
     result.add_argument("--high-confidence-stop-loss", type=Decimal, default=Decimal("0.097"),
                         help="fractional loss from average fill that triggers high-confidence stop (default: 0.097)")
+    result.add_argument("--high-confidence-confirm-up-ticks", type=int, default=2,
+                        help="strict sampled upticks required before high-confidence entry (default: 2)")
+    result.add_argument("--high-confidence-sample-seconds", type=float, default=0.5,
+                        help="minimum interval between high-confidence confirmation samples (default: 0.5)")
+    result.add_argument("--high-confidence-max-sample-gap-seconds", type=float, default=1.5,
+                        help="reset confirmation after a larger sample gap (default: 1.5)")
     result.add_argument("--signal-threshold", type=Decimal, default=Decimal("0.58"), help="price level that starts entry confirmation (default: 0.58)")
     result.add_argument("--entry", type=Decimal, default=Decimal("0.60"), help="minimum ask price for a paper buy (default: 0.60)")
     result.add_argument("--stake", type=Decimal, default=Decimal("4.00"), help="virtual amount per trade in USD (default: 4)")
@@ -894,6 +934,11 @@ def main() -> int:
     if (not (ZERO < args.high_confidence_min_price < args.high_confidence_max_price < Decimal("1"))
             or not (ZERO < args.high_confidence_stop_loss < Decimal("1"))):
         print("high-confidence price bounds must be between 0 and 1, and stop-loss must be a fraction between 0 and 1.", file=sys.stderr)
+        return 2
+    if (args.high_confidence_confirm_up_ticks < 1
+            or args.high_confidence_sample_seconds <= 0
+            or args.high_confidence_max_sample_gap_seconds < args.high_confidence_sample_seconds):
+        print("high-confidence confirmation ticks and sample intervals must be positive, and max sample gap must be at least the sample interval.", file=sys.stderr)
         return 2
     if args.max_spread is not None and args.max_spread <= ZERO:
         print("max-spread must be positive.", file=sys.stderr)
