@@ -18,16 +18,25 @@
 - 模拟成交计入可配置的 taker fee（默认 7% 的费率参数，按 Polymarket 加密市场公式估算）。实际费用可能因市场设置变化；模拟结果仅供比较策略。
 - 只同时持有一个仓位，每个 5 分钟市场最多入场一次。
 
-## 高确定性价格策略
+## 高确定性价格策略（优化分支 feature/high-confidence-optimized）
 
-通过独立策略分支模拟买入市场价格显示高胜率的 Up/Down 结果份额：
+通过独立策略分支模拟买入市场价格显示高胜率的 Up/Down 结果份额，针对历史交易日志中暴露的**止损恶性滑点穿透**与**秒级虚假波动杀跌**进行了全面优化：
 
 - 启动参数使用 `--strategy high-confidence`。
-- 卖一价（ask）进入 78¢–95¢ 区间后，还需每 0.5 秒采样到 2 次连续严格上涨（共 3 个递增 mid 样本）才入场；样本间隔超过 1.5 秒或价格回落时重新确认。点差、盘口深度、市场开盘等待和临近结束不入场规则继续生效。
-- 默认止盈目标为入场均价的 1.2 倍，最高封顶 99¢，避免高价入场时目标超过合约最高价；止损价按实际模拟成交均价计算：`均价 × (1 - 0.097)`。
-- 高确定性模式在可成交 bid 到达止损价时立即触发止损，不再额外等待 mid 跌破；实际卖出仍按当时买盘档位模拟，成交低于止损价的差额会写入 `bot.log` 的 `stop_gap_per_share`。
-- 此模式关闭默认的停滞退出；止盈设置、到期前强制退出和其他模拟成交规则仍然有效。
-- 区间、确认次数/采样间隔、最大样本间隔和止损比例可通过 `--high-confidence-min-price`、`--high-confidence-max-price`、`--high-confidence-confirm-up-ticks`、`--high-confidence-sample-seconds`、`--high-confidence-max-sample-gap-seconds`、`--high-confidence-stop-loss` 调整。
+- **入场点差与确认**：
+  - 卖一价（ask）进入 78¢–95¢ 区间后，需每 0.5 秒采样到 2 次连续严格上涨（共 3 个递增 mid 样本）才入场；样本间隔超过 1.5 秒或价格回落时重新确认。
+  - **更紧凑的点差限制**：高确定性模式默认要求点差 `<= 0.025`（`--high-confidence-max-spread 0.025`），防止过宽点差导致入场即濒临止损。
+  - **买盘承接深度保护**：入场时严格检查止损底线价以上的买盘总深度必须满足至少 5 股（`--high-confidence-min-bid-depth 5.0`），无承接盘或承接不足时不盲目开仓。
+- **出场与止盈止损优化**：
+  - **目标止盈**：默认为入场均价的 1.2 倍，最高封顶 99¢。
+  - **基准止损**：按实际模拟成交均价计算：`均价 × (1 - 0.097)`。
+  - **止损防插针毛刺（Anti-Whipsaw）**：当 bid 跌破止损价时，需同时满足中间价 `mid <= stop + 0.015`（`--high-confidence-stop-mid-buffer 0.015`），过滤瞬时虚假点差拉大导致的假突破被止损。
+  - **恶性滑点硬封顶（Slippage Floor）**：止损单平仓时引入最低限价保护，单笔卖出成交价不允许低于 `stop - 0.035`（`--high-confidence-max-stop-slippage 0.035`），严禁市价扫穿到 0.54 等稀薄流动性深渊。
+  - **保本与动态移动止损（Breakeven & Trailing Stop）**：
+    - 当价格上涨 `mid >= entry_price + 0.06` 时（`--high-confidence-breakeven-trigger 0.06`），自动将止损位提升至保本位（`entry_price + 0.005`，覆盖手续费）。
+    - 启动动态移动止损跟踪（`--high-confidence-trailing-stop 0.07`），锁定浮动盈利，避免大幅盈利回撤转亏。
+- 此模式关闭默认的停滞退出；到期前强制退出和其他模拟成交规则仍然有效。
+- 可配参数：`--high-confidence-min-price`、`--high-confidence-max-price`、`--high-confidence-max-spread`、`--high-confidence-min-bid-depth`、`--high-confidence-stop-loss`、`--high-confidence-max-stop-slippage`、`--high-confidence-stop-mid-buffer`、`--high-confidence-breakeven-trigger`、`--high-confidence-trailing-stop`、`--high-confidence-confirm-up-ticks`、`--high-confidence-sample-seconds`、`--high-confidence-max-sample-gap-seconds`。
 
 示例：
 

@@ -424,14 +424,15 @@ class LocalPaperBot:
         avg = gross / qty_total if qty_total else ZERO
         return qty_total, avg, gross, fees
 
-    def simulate_sell(self, asset_id: str, quantity: Decimal) -> tuple[Decimal, Decimal, Decimal, Decimal, list[tuple[Decimal, Decimal]]]:
+    def simulate_sell(self, asset_id: str, quantity: Decimal,
+                      min_price: Decimal | None = None) -> tuple[Decimal, Decimal, Decimal, Decimal, list[tuple[Decimal, Decimal]]]:
         levels = self.books[asset_id]["bids"]
         remaining = quantity
         sold = gross = fees = ZERO
         fills: list[tuple[Decimal, Decimal]] = []
         market = self.asset_meta[asset_id]["market"]
         for price in sorted(levels, reverse=True):
-            if price <= ZERO:
+            if price <= ZERO or (min_price is not None and price < min_price):
                 continue
             take = min(levels[price], remaining)
             if take <= ZERO:
@@ -539,7 +540,7 @@ class LocalPaperBot:
 
         if self.position and self.position.get("asset_id") == asset_id:
             self.position["last_bid"] = str(bid or ZERO)
-            target, stop = D(self.position["target"]), D(self.position["stop"])
+            target, base_stop = D(self.position["target"]), D(self.position["stop"])
             entry_price = D(self.position.get("entry_price") or ZERO)
             now = time.time()
 
@@ -547,6 +548,22 @@ class LocalPaperBot:
             if mid > highest_mid:
                 highest_mid = mid
                 self.position["highest_mid"] = str(highest_mid)
+
+            current_stop = base_stop
+            if self.args.strategy == "high-confidence":
+                # 1. Breakeven stop adjustment
+                if self.args.high_confidence_breakeven_trigger > ZERO:
+                    if highest_mid >= entry_price + self.args.high_confidence_breakeven_trigger:
+                        breakeven_stop = entry_price + Decimal("0.005")
+                        current_stop = max(current_stop, breakeven_stop)
+
+                # 2. Dynamic trailing stop adjustment
+                if self.args.high_confidence_trailing_stop > ZERO:
+                    trailing_stop = highest_mid - self.args.high_confidence_trailing_stop
+                    current_stop = max(current_stop, trailing_stop)
+
+                if current_stop > base_stop:
+                    self.position["stop"] = str(current_stop)
 
             try:
                 entry_at = datetime.fromisoformat(self.position["entry_at"])
@@ -557,9 +574,14 @@ class LocalPaperBot:
             reason = ""
             if mid >= target and bid is not None and bid >= target:
                 reason = "take_profit"
-            elif (bid is not None and bid <= stop
-                  and (self.args.strategy == "high-confidence" or mid <= stop)):
-                reason = "stop_loss"
+            elif bid is not None and bid <= current_stop:
+                if self.args.strategy == "high-confidence":
+                    # Require mid to also confirm the drop within buffer, preventing phantom quote flicker wicks
+                    if mid <= current_stop + self.args.high_confidence_stop_mid_buffer:
+                        reason = "stop_loss"
+                else:
+                    if mid <= current_stop:
+                        reason = "stop_loss"
             elif market["end_ts"] - now <= self.args.force_exit_last_seconds:
                 reason = "time_exit"
             elif (self.args.strategy != "high-confidence"
@@ -607,11 +629,14 @@ class LocalPaperBot:
                 print(f"{stamp} {market['slug']} {outcome} entry skipped: bid unavailable; mid={mid:.4f}")
             return
         spread = ask - bid
-        if self.args.max_spread is not None and spread > self.args.max_spread:
+        max_allowed_spread = (self.args.high_confidence_max_spread
+                              if self.args.strategy == "high-confidence" and self.args.high_confidence_max_spread is not None
+                              else self.args.max_spread)
+        if max_allowed_spread is not None and spread > max_allowed_spread:
             if self.args.strategy != "high-confidence":
                 print(f"{stamp} {market['slug']} {outcome} entry skipped: "
                       f"spread too wide; mid={mid:.4f}, bid={bid:.4f}, ask={ask:.4f}, "
-                      f"spread={spread:.4f}, max_allowed={self.args.max_spread:.4f}")
+                      f"spread={spread:.4f}, max_allowed={max_allowed_spread:.4f}")
             return
         if self.args.strategy == "high-confidence":
             min_price = self.args.high_confidence_min_price
@@ -648,6 +673,13 @@ class LocalPaperBot:
                 target = min(Decimal("0.99"), target)
         if self.args.strategy == "high-confidence":
             stop = avg * (Decimal("1") - self.args.high_confidence_stop_loss)
+            # Bid liquidity guard: verify that the book has executable bids above stop floor to prevent catastrophic stop slippage
+            min_stop_floor = max(ZERO, stop - self.args.high_confidence_max_stop_slippage)
+            bid_levels = self.books[asset_id]["bids"]
+            available_bids = sum((shares for p, shares in bid_levels.items() if p >= min_stop_floor), ZERO)
+            required_bids = max(min_size, self.args.high_confidence_min_bid_depth)
+            if available_bids < required_bids:
+                return
         else:
             stop = self.args.stop_price if self.args.stop_price is not None else avg * self.args.stop_multiple
         self.cash -= cost
@@ -706,10 +738,15 @@ class LocalPaperBot:
               f"ask={price_text('ask')}, last_trade={price_text('last_trade')}, "
               f"book_age_ms={trigger.get('book_age_ms', 'n/a')}, position_age_s={position_age:.3f}")
         qty = D(position["quantity"])
-        sold, avg, gross, fees, fills = self.simulate_sell(asset_id, qty)
+        min_sell_price = None
+        if reason == "stop_loss" and self.args.strategy == "high-confidence":
+            min_sell_price = max(ZERO, D(position["stop"]) - self.args.high_confidence_max_stop_slippage)
+
+        sold, avg, gross, fees, fills = self.simulate_sell(asset_id, qty, min_price=min_sell_price)
         if sold <= ZERO:
+            limit_msg = f" >= {min_sell_price:.4f}" if min_sell_price is not None else ""
             print(f"{stamp} {market['slug']} {position['outcome']} EXIT_DEFERRED reason={reason}; "
-                  "no executable bid levels; paper position remains open.")
+                  f"no executable bid levels{limit_msg}; paper position remains open.")
             return
         fill_text = ",".join(f"{price:.4f}x{shares:.4f}" for price, shares in fills)
         cost_left = D(position["entry_cost"])
@@ -806,10 +843,15 @@ class LocalPaperBot:
         assets = self.discover()
         print(f"Polymarket public-market paper trader | starting virtual cash ${self.args.initial_cash:.2f}")
         if self.args.strategy == "high-confidence":
+            spread_limit = (f"{self.args.high_confidence_max_spread:.3f}"
+                            if self.args.high_confidence_max_spread is not None else "none")
             print(f"Strategy: high-confidence outcome entry; buy only when ask is "
                   f"{self.args.high_confidence_min_price:.2f}-{self.args.high_confidence_max_price:.2f} "
-                  f"and spread <= {self.args.max_spread:.2f}; stop loss="
+                  f"and spread <= {spread_limit}; stop loss="
                   f"{self.args.high_confidence_stop_loss * Decimal('100'):.1f}% from average fill; "
+                  f"max stop slippage={self.args.high_confidence_max_stop_slippage:.3f}; "
+                  f"breakeven trigger=+{self.args.high_confidence_breakeven_trigger:.2f}; "
+                  f"trailing stop={self.args.high_confidence_trailing_stop:.2f}; "
                   f"entry confirmation={self.args.high_confidence_confirm_up_ticks} sampled upticks "
                   f"every {self.args.high_confidence_sample_seconds:.1f}s; "
                   f"stall exit disabled; entry checks start {self.args.entry_delay_seconds}s after market open.")
@@ -879,8 +921,20 @@ def parser() -> argparse.ArgumentParser:
                         help="minimum ask price for high-confidence entries (default: 0.78)")
     result.add_argument("--high-confidence-max-price", type=Decimal, default=Decimal("0.95"),
                         help="maximum ask price for high-confidence entries (default: 0.95)")
+    result.add_argument("--high-confidence-max-spread", type=Decimal, default=Decimal("0.025"),
+                        help="maximum bid-ask spread allowed for high-confidence entry (default: 0.025)")
+    result.add_argument("--high-confidence-min-bid-depth", type=Decimal, default=Decimal("5.0"),
+                        help="minimum executable bid shares above stop floor before entry (default: 5.0)")
     result.add_argument("--high-confidence-stop-loss", type=Decimal, default=Decimal("0.097"),
                         help="fractional loss from average fill that triggers high-confidence stop (default: 0.097)")
+    result.add_argument("--high-confidence-max-stop-slippage", type=Decimal, default=Decimal("0.035"),
+                        help="maximum allowed slippage below stop price on stop-loss exit (default: 0.035)")
+    result.add_argument("--high-confidence-stop-mid-buffer", type=Decimal, default=Decimal("0.015"),
+                        help="max excess of mid over stop price to confirm stop-loss trigger (default: 0.015)")
+    result.add_argument("--high-confidence-breakeven-trigger", type=Decimal, default=Decimal("0.06"),
+                        help="gain above entry price to move stop to breakeven (default: 0.06, 0 to disable)")
+    result.add_argument("--high-confidence-trailing-stop", type=Decimal, default=Decimal("0.07"),
+                        help="trailing stop distance from highest mid once profitable (default: 0.07, 0 to disable)")
     result.add_argument("--high-confidence-confirm-up-ticks", type=int, default=2,
                         help="strict sampled upticks required before high-confidence entry (default: 2)")
     result.add_argument("--high-confidence-sample-seconds", type=float, default=0.5,
@@ -939,6 +993,16 @@ def main() -> int:
             or args.high_confidence_sample_seconds <= 0
             or args.high_confidence_max_sample_gap_seconds < args.high_confidence_sample_seconds):
         print("high-confidence confirmation ticks and sample intervals must be positive, and max sample gap must be at least the sample interval.", file=sys.stderr)
+        return 2
+    if args.high_confidence_max_spread is not None and args.high_confidence_max_spread <= ZERO:
+        print("high-confidence max-spread must be positive.", file=sys.stderr)
+        return 2
+    if (args.high_confidence_min_bid_depth < ZERO
+            or args.high_confidence_max_stop_slippage < ZERO
+            or args.high_confidence_stop_mid_buffer < ZERO
+            or args.high_confidence_breakeven_trigger < ZERO
+            or args.high_confidence_trailing_stop < ZERO):
+        print("high-confidence slippage, depth, buffer, and trailing parameters must be non-negative.", file=sys.stderr)
         return 2
     if args.max_spread is not None and args.max_spread <= ZERO:
         print("max-spread must be positive.", file=sys.stderr)
