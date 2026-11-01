@@ -26,6 +26,45 @@ ZERO = Decimal("0")
 FEE_RATE = Decimal("0.07")  # Polymarket crypto taker fee rate; override with --fee-rate.
 
 
+class TelegramNotifier:
+    """Sends real-time simulation trade notifications to Telegram."""
+    def __init__(self, token: str | None, chat_id: str | None, proxy: str | None = "http://127.0.0.1:7897"):
+        self.token = token
+        self.chat_id = chat_id
+        self.proxy = proxy
+        self.opener = None
+        if token and chat_id:
+            try:
+                import urllib.request
+                if proxy:
+                    handler = urllib.request.ProxyHandler({'http': proxy, 'https': proxy})
+                    self.opener = urllib.request.build_opener(handler)
+                else:
+                    self.opener = urllib.request.build_opener()
+            except Exception as e:
+                print(f"[TelegramNotifier] Init error: {e}")
+
+    def send(self, text: str) -> None:
+        if not self.token or not self.chat_id or not self.opener:
+            return
+        import urllib.request
+        import json
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            self.opener.open(req, timeout=8)
+        except Exception as e:
+            print(f"[TelegramNotifier] Send failed: {e}")
+
 class Tee:
     """Write console output to both the terminal and the persistent run log."""
 
@@ -228,6 +267,9 @@ class LocalPaperBot:
         self.cash = args.initial_cash
         self.realized_pnl = ZERO
         self.position: dict[str, Any] | None = None
+        self.notifier = None
+        if getattr(args, "telegram_notify", False):
+            self.notifier = TelegramNotifier(args.telegram_token, args.telegram_chat_id, args.telegram_proxy)
         self._load_state()
 
     def _load_state(self) -> None:
@@ -555,6 +597,15 @@ class LocalPaperBot:
                 if self.args.high_confidence_breakeven_trigger > ZERO:
                     if highest_mid >= entry_price + self.args.high_confidence_breakeven_trigger:
                         breakeven_stop = entry_price + Decimal("0.005")
+                        if not self.position.get("be_alerted"):
+                            self.position["be_alerted"] = True
+                            if self.notifier:
+                                self.notifier.send(
+                                    f"🛡 <b>【BTC 5m 保本保护激活】</b>\n"
+                                    f"• <b>市场：</b> <code>{market['slug']}</code>\n"
+                                    f"• 浮盈已达 +${self.args.high_confidence_breakeven_trigger:.2f}！\n"
+                                    f"• 止损已提至保本价：<b>${breakeven_stop:.4f}</b>，锁定利润防回撤！"
+                                )
                         current_stop = max(current_stop, breakeven_stop)
 
                 # 2. Dynamic trailing stop adjustment
@@ -572,7 +623,14 @@ class LocalPaperBot:
                 pos_age = 0.0
 
             reason = ""
-            if mid >= target and bid is not None and bid >= target:
+            last_trade_val = D(book.get("last_trade") or 0)
+            tp_hit = False
+            if getattr(self.args, "maker_take_profit", False):
+                tp_hit = (mid >= target or (bid is not None and bid >= target) or (ask is not None and ask >= target) or last_trade_val >= target)
+            else:
+                tp_hit = (mid >= target and bid is not None and bid >= target)
+
+            if tp_hit:
                 reason = "take_profit"
             elif bid is not None and bid <= current_stop:
                 if self.args.strategy == "high-confidence":
@@ -708,6 +766,19 @@ class LocalPaperBot:
         print(f"{stamp} {market['slug']} {outcome} paper buy {qty:.4f} shares at avg {avg:.3f}; "
               f"trigger_mid={mid:.4f}, bid={bid_text}, ask={ask_text}, book_age_ms={book_age_ms}; "
               f"take_profit={target:.3f}, stop={stop:.3f}, fees=${fees:.4f}")
+        if self.notifier:
+            icon = "🟢 ⬆️" if outcome == "Up" else "🔴 ⬇️"
+            self.notifier.send(
+                f"{icon} <b>【BTC 5m 模拟开仓】</b>\n"
+                f"• <b>市场：</b> <code>{market['slug']}</code>\n"
+                f"• <b>预测方向：</b> <b>{outcome}</b>\n"
+                f"• <b>买入均价：</b> ${avg:.4f}\n"
+                f"• <b>买入金额：</b> ${gross:.2f} ({qty:.4f} 份)\n"
+                f"• <b>限价止盈(Maker)：</b> <b>${target:.4f}</b> (挂单待成交，0手续费)\n"
+                f"• <b>硬止损底线：</b> ${stop:.4f}\n"
+                f"• <b>买入手续费：</b> ${fees:.4f}\n"
+                f"• <b>当前账户余额：</b> ${self.cash:.2f}"
+            )
 
     def exit(self, asset_id: str, reason: str, trigger: dict[str, Any] | None = None) -> None:
         position = self.position
@@ -742,7 +813,15 @@ class LocalPaperBot:
         if reason == "stop_loss" and self.args.strategy == "high-confidence":
             min_sell_price = max(ZERO, D(position["stop"]) - self.args.high_confidence_max_stop_slippage)
 
-        sold, avg, gross, fees, fills = self.simulate_sell(asset_id, qty, min_price=min_sell_price)
+        if reason == "take_profit" and getattr(self.args, "maker_take_profit", False):
+            # Maker Limit Order filled passively: exact target price, 0 Maker fees on Polymarket!
+            sold = qty
+            avg = D(position["target"])
+            gross = sold * avg
+            fees = ZERO
+            fills = [(avg, sold)]
+        else:
+            sold, avg, gross, fees, fills = self.simulate_sell(asset_id, qty, min_price=min_sell_price)
         if sold <= ZERO:
             limit_msg = f" >= {min_sell_price:.4f}" if min_sell_price is not None else ""
             print(f"{stamp} {market['slug']} {position['outcome']} EXIT_DEFERRED reason={reason}; "
@@ -779,6 +858,28 @@ class LocalPaperBot:
               f"sold={sold:.4f}, avg={avg:.4f}, levels=[{fill_text}], fees=${fees:.4f}, "
               f"net_P&L=${pnl:.4f}, cumulative_realized_P&L=${self.realized_pnl:.4f}"
               f"{stop_gap_text}")
+        if self.notifier:
+            reason_map = {
+                "take_profit": "🎯 挂单止盈 (Maker)",
+                "stop_loss": "🛑 触发止损",
+                "time_exit": "⏱ 到期结算",
+                "breakout_failure": "⚠️ 动量停滞退出"
+            }
+            reason_cn = reason_map.get(reason, reason)
+            pnl_icon = "💰" if pnl > 0 else "🔻"
+            pnl_sign = "+" if pnl > 0 else ""
+            entry_p = D(position['entry_price'])
+            pnl_pct = ((avg - entry_p) / entry_p * 100) if entry_p > 0 else 0
+            self.notifier.send(
+                f"{pnl_icon} <b>【BTC 5m 模拟平仓 ({reason_cn})】</b>\n"
+                f"• <b>市场：</b> <code>{market['slug']}</code>\n"
+                f"• <b>方向：</b> <b>{position['outcome']}</b>\n"
+                f"• <b>买入 ➔ 卖出：</b> ${entry_p:.4f} ➔ <b>${avg:.4f}</b>\n"
+                f"• <b>单笔净盈亏：</b> <b>{pnl_sign}${pnl:.4f} ({pnl_pct:+.2f}%)</b>\n"
+                f"• <b>平仓手续费：</b> ${fees:.4f}\n"
+                f"• <b>持仓时间：</b> {position_age:.1f} 秒\n"
+                f"• <b>当前账户余额：</b> <b>${self.cash:.2f}</b> (累计盈亏: ${self.realized_pnl:+.2f})"
+            )
         if D(position["quantity"]) <= Decimal("0.000001"):
             self.position = None
             self.save_state()
@@ -880,6 +981,22 @@ class LocalPaperBot:
                 ws.settimeout(1)
                 ws.send(json.dumps({"assets_ids": assets, "type": "market", "custom_feature_enabled": True}))
                 print(f"Connected to Polymarket public market data; subscribed to {len(assets)} Up/Down outcomes.")
+                if self.notifier and not getattr(self, "_started_notified", False):
+                    tp_desc = f"Maker 挂单 (0 手续费, 封顶 {self.args.max_tp_cap})" if getattr(self.args, "maker_take_profit", False) else "市价 Taker"
+                    self.notifier.send(
+                        f"🚀 <b>Polymarket BTC 5m 模拟跑单系统已上线！</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 <b>策略模型</b>: <code>高胜率突破动量 (High-Confidence)</code>\n"
+                        f"🎯 <b>买入价格区间</b>: <code>{self.args.high_confidence_min_price:.2f} ~ {self.args.high_confidence_max_price:.2f}</code>\n"
+                        f"⚡ <b>最大允许点差</b>: <code>≤ {self.args.high_confidence_max_spread}</code>\n"
+                        f"💵 <b>单笔下注本金</b>: <code>${self.args.stake:.2f}</code>\n"
+                        f"💰 <b>账户初始现金</b>: <code>${self.cash:.2f}</code>\n"
+                        f"📈 <b>止盈执行模式</b>: <b>{tp_desc}</b>\n"
+                        f"🛡️ <b>止损与防滑点</b>: <code>{self.args.high_confidence_stop_loss*100:.1f}% (滑点保护 3.5¢, 6¢ 浮盈保本)</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━\n"
+                        f"✅ 已成功连接盘口，开始实时盯盘。任何开仓、平仓与止盈都将第一时间推送到这里！"
+                    )
+                    self._started_notified = True
                 last_refresh = time.monotonic()
                 last_ping = time.monotonic()
                 while True:
@@ -917,6 +1034,12 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description="Local paper trading on Polymarket BTC 5-minute Up/Down")
     result.add_argument("--strategy", choices=("default", "high-confidence"), default="default",
                         help="entry strategy: default breakout confirmation or high-confidence price range")
+    result.add_argument("--telegram-notify", action="store_true", default=True, help="send trade alerts to Telegram")
+    result.add_argument("--telegram-token", default="9192491427:AAEeig8QGEBk5ChlKhesFyybCNBxmn-6ogE", help="Telegram bot token")
+    result.add_argument("--telegram-chat-id", default="6211089621", help="Telegram target chat ID")
+    result.add_argument("--telegram-proxy", default="http://127.0.0.1:7897", help="Proxy for Telegram API")
+    result.add_argument("--maker-take-profit", action="store_true", default=True, help="place resting Maker limit sell order for take-profit at 0 fee")
+    result.add_argument("--max-tp-cap", type=Decimal, default=Decimal("0.94"), help="maximum limit price cap for take profit (default: 0.94)")
     result.add_argument("--high-confidence-min-price", type=Decimal, default=Decimal("0.78"),
                         help="minimum ask price for high-confidence entries (default: 0.78)")
     result.add_argument("--high-confidence-max-price", type=Decimal, default=Decimal("0.95"),
