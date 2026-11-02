@@ -17,7 +17,17 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+import requests
+
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.proxies.update({
+    "http": "http://127.0.0.1:7897",
+    "https": "http://127.0.0.1:7897"
+})
+import os
+if 'HTTP_PROXY' not in os.environ and 'http_proxy' not in os.environ:
+    os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7897'
+    os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7897' 
 
 ROOT = Path(__file__).resolve().parent
 GAMMA = "https://gamma-api.polymarket.com"
@@ -31,24 +41,13 @@ class TelegramNotifier:
     def __init__(self, token: str | None, chat_id: str | None, proxy: str | None = "http://127.0.0.1:7897"):
         self.token = token
         self.chat_id = chat_id
-        self.proxy = proxy
-        self.opener = None
-        if token and chat_id:
-            try:
-                import urllib.request
-                if proxy:
-                    handler = urllib.request.ProxyHandler({'http': proxy, 'https': proxy})
-                    self.opener = urllib.request.build_opener(handler)
-                else:
-                    self.opener = urllib.request.build_opener()
-            except Exception as e:
-                print(f"[TelegramNotifier] Init error: {e}")
+        self.session = requests.Session()
+        if proxy:
+            self.session.proxies.update({"http": proxy, "https": proxy})
 
     def send(self, text: str) -> None:
-        if not self.token or not self.chat_id or not self.opener:
+        if not self.token or not self.chat_id:
             return
-        import urllib.request
-        import json
         url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         payload = {
             "chat_id": self.chat_id,
@@ -56,12 +55,7 @@ class TelegramNotifier:
             "parse_mode": "HTML"
         }
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-            self.opener.open(req, timeout=8)
+            self.session.post(url, json=payload, timeout=8)
         except Exception as e:
             print(f"[TelegramNotifier] Send failed: {e}")
 
@@ -73,14 +67,31 @@ class Tee:
         self.log_file = log_file
 
     def write(self, text: str) -> int:
-        self.console.write(text)
-        self.log_file.write(text)
-        self.log_file.flush()
+        try:
+            self.console.write(text)
+        except Exception:
+            try:
+                enc = getattr(self.console, "encoding", None) or "gbk"
+                safe_text = text.encode(enc, errors="replace").decode(enc)
+                self.console.write(safe_text)
+            except Exception:
+                pass
+        try:
+            self.log_file.write(text)
+            self.log_file.flush()
+        except Exception:
+            pass
         return len(text)
 
     def flush(self) -> None:
-        self.console.flush()
-        self.log_file.flush()
+        try:
+            self.console.flush()
+        except Exception:
+            pass
+        try:
+            self.log_file.flush()
+        except Exception:
+            pass
 
 
 def D(value: Any, fallback: str = "0") -> Decimal:
@@ -95,16 +106,22 @@ def utc_now() -> datetime:
 
 
 def gamma_json(url: str) -> Any:
-    req = Request(url, headers={"Accept": "application/json", "User-Agent": "btc5m-local-paper-trader/1.0"})
-    try:
-        with urlopen(req, timeout=10) as response:
-            return json.loads(response.read())
-    except HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise RuntimeError(f"Polymarket Gamma HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')}") from exc
-    except (URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Polymarket Gamma connection failed: {exc}") from exc
+    for attempt in range(3):
+        try:
+            resp = HTTP_SESSION.get(
+                url,
+                headers={"Accept": "application/json", "User-Agent": "btc5m-local-paper-trader/1.0"},
+                timeout=12
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:
+            if attempt == 2:
+                raise RuntimeError(f"Polymarket Gamma connection failed: {exc}") from exc
+            time.sleep(1)
+    return None
 
 
 def json_list(value: Any) -> list[Any]:
@@ -513,6 +530,9 @@ class LocalPaperBot:
             window = samples[-needed:]
             if any(window[i][1] <= window[i - 1][1] for i in range(1, len(window))):
                 return False
+            stamp = utc_now().isoformat(timespec="seconds")
+            meta = self.asset_meta[asset_id]
+            print(f"[{stamp}] [UPTICK_CONFIRMED] {meta['market']['slug']} {meta['outcome']} 触发连续上涨确认！ask={ask:.3f}, mid={mid:.3f}")
             samples.clear()
             return True
 
@@ -579,6 +599,15 @@ class LocalPaperBot:
                 self.stale_logged.add(asset_id)
             return
         self.stale_logged.discard(asset_id)
+
+        if self.args.strategy == "high-confidence":
+            last_diag = book.get("last_diag", 0.0)
+            now_mono = time.monotonic()
+            if (now_mono - last_diag >= 30.0) or (ask is not None and ask >= Decimal("0.70") and now_mono - last_diag >= 5.0):
+                book["last_diag"] = now_mono
+                spread_val = (ask - bid) if (bid is not None and ask is not None) else Decimal("0")
+                stamp = utc_now().isoformat(timespec="seconds")
+                print(f"[{stamp}] {market['slug']} {outcome} 监控: bid={bid}, ask={ask}, mid={mid}, spread={spread_val:.3f} (目标区间 0.78~0.95)")
 
         if self.position and self.position.get("asset_id") == asset_id:
             self.position["last_bid"] = str(bid or ZERO)
@@ -710,7 +739,10 @@ class LocalPaperBot:
         budget = min(self.args.stake, self.cash)
         qty, avg, gross, fees = self.simulate_buy(asset_id, budget, max_price)
         min_size = D(self.books[asset_id].get("min_order_size") or market.get("min_order_size"))
-        required_shares = max(min_size, self.args.min_depth_shares)
+        if self.args.strategy == "high-confidence":
+            required_shares = Decimal("1.0")
+        else:
+            required_shares = max(min_size, self.args.min_depth_shares)
         if qty <= ZERO or qty < required_shares:
             if self.args.strategy != "high-confidence":
                 print(f"{stamp} {market['slug']} {outcome} entry skipped: "
@@ -977,7 +1009,7 @@ class LocalPaperBot:
                         continue
                 # Give the TLS/WebSocket handshake time on slower networks, then
                 # use short reads so refresh and heartbeat checks stay timely.
-                ws = websocket.create_connection(WS_URL, timeout=15, suppress_origin=True)
+                ws = websocket.create_connection(WS_URL, timeout=15, suppress_origin=True, http_proxy_host="127.0.0.1", http_proxy_port=7897)
                 ws.settimeout(1)
                 ws.send(json.dumps({"assets_ids": assets, "type": "market", "custom_feature_enabled": True}))
                 print(f"Connected to Polymarket public market data; subscribed to {len(assets)} Up/Down outcomes.")
@@ -1062,7 +1094,7 @@ def parser() -> argparse.ArgumentParser:
                         help="strict sampled upticks required before high-confidence entry (default: 2)")
     result.add_argument("--high-confidence-sample-seconds", type=float, default=0.5,
                         help="minimum interval between high-confidence confirmation samples (default: 0.5)")
-    result.add_argument("--high-confidence-max-sample-gap-seconds", type=float, default=1.5,
+    result.add_argument("--high-confidence-max-sample-gap-seconds", type=float, default=8.0,
                         help="reset confirmation after a larger sample gap (default: 1.5)")
     result.add_argument("--signal-threshold", type=Decimal, default=Decimal("0.58"), help="price level that starts entry confirmation (default: 0.58)")
     result.add_argument("--entry", type=Decimal, default=Decimal("0.60"), help="minimum ask price for a paper buy (default: 0.60)")
@@ -1136,15 +1168,16 @@ def main() -> int:
     if args.stall_timeout_seconds < 0:
         print("stall-timeout-seconds cannot be negative.", file=sys.stderr)
         return 2
-    try:
-        LocalPaperBot(args).run()
-        return 0
-    except KeyboardInterrupt:
-        print("Stopped.")
-        return 130
-    except Exception as exc:
-        print(f"Startup failed: {exc}", file=sys.stderr)
-        return 1
+    while True:
+        try:
+            LocalPaperBot(args).run()
+            return 0
+        except KeyboardInterrupt:
+            print("Stopped.")
+            return 130
+        except Exception as exc:
+            print(f"Engine auto-recovering from error: {exc}; restarting in 5s...", file=sys.stderr)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
