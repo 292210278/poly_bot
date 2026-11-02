@@ -19,13 +19,22 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 import requests
 
+import os, socket
+def is_local_proxy_available(host="127.0.0.1", port=7897) -> bool:
+    try:
+        s = socket.create_connection((host, port), timeout=0.3)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+USE_LOCAL_PROXY = is_local_proxy_available()
 HTTP_SESSION = requests.Session()
-HTTP_SESSION.proxies.update({
-    "http": "http://127.0.0.1:7897",
-    "https": "http://127.0.0.1:7897"
-})
-import os
-if 'HTTP_PROXY' not in os.environ and 'http_proxy' not in os.environ:
+if USE_LOCAL_PROXY:
+    HTTP_SESSION.proxies.update({
+        "http": "http://127.0.0.1:7897",
+        "https": "http://127.0.0.1:7897"
+    })
     os.environ['HTTP_PROXY'] = 'http://127.0.0.1:7897'
     os.environ['HTTPS_PROXY'] = 'http://127.0.0.1:7897' 
 
@@ -42,7 +51,7 @@ class TelegramNotifier:
         self.token = token
         self.chat_id = chat_id
         self.session = requests.Session()
-        if proxy:
+        if proxy and USE_LOCAL_PROXY:
             self.session.proxies.update({"http": proxy, "https": proxy})
 
     def send(self, text: str) -> None:
@@ -1009,7 +1018,10 @@ class LocalPaperBot:
                         continue
                 # Give the TLS/WebSocket handshake time on slower networks, then
                 # use short reads so refresh and heartbeat checks stay timely.
-                ws = websocket.create_connection(WS_URL, timeout=15, suppress_origin=True, http_proxy_host="127.0.0.1", http_proxy_port=7897)
+                if USE_LOCAL_PROXY:
+                    ws = websocket.create_connection(WS_URL, timeout=15, suppress_origin=True, http_proxy_host="127.0.0.1", http_proxy_port=7897)
+                else:
+                    ws = websocket.create_connection(WS_URL, timeout=15, suppress_origin=True)
                 ws.settimeout(1)
                 ws.send(json.dumps({"assets_ids": assets, "type": "market", "custom_feature_enabled": True}))
                 print(f"Connected to Polymarket public market data; subscribed to {len(assets)} Up/Down outcomes.")
